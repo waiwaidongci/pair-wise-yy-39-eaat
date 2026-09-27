@@ -4,6 +4,7 @@ TITLE='大坝巡检、缺陷与应急管理'; ENTITY='大坝缺陷'; ID_PREFIX='
 SEVERITIES=['observation', 'minor', 'major', 'emergency']; STATES=['planned', 'inspected', 'defect_confirmed', 'repair', 'verified', 'closed']; TRANSITIONS={'planned': ['inspected'], 'inspected': ['defect_confirmed'], 'defect_confirmed': ['repair'], 'repair': ['verified'], 'verified': ['closed'], 'closed': []}; TRANSITION_ROLES={'inspected': ['inspector'], 'defect_confirmed': ['dam_engineer'], 'repair': ['dam_engineer'], 'verified': ['inspector'], 'closed': ['emergency_manager']}
 CREATE_ROLES=set(['inspector']); RECORD_ROLES=set(['inspector', 'dam_engineer']); AUDIT_ROLES=set(['emergency_manager', 'viewer']); VIEW_ROLES=set(['inspector', 'dam_engineer', 'emergency_manager', 'viewer'])
 SEVERITY_WEIGHT={'observation': 1.0, 'minor': 3.0, 'major': 6.0, 'emergency': 9.0}; DEADLINE_HOURS={'observation': 72, 'minor': 24, 'major': 8, 'emergency': 4}; TERMINAL_STATES=set(['closed'])
+RECURRENCE_ESCALATION_LIMIT=3; ESCALATION_STATUSES=['none', 'pending', 'confirmed']; ESCALATION_CONFIRM_ROLES=set(['emergency_manager'])
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
     ratio=quantity/threshold if threshold>0 else 1.0
@@ -14,9 +15,22 @@ def response_deadline_hours(severity,quantity=0.0,threshold=1.0):
     return max(1,int(DEADLINE_HOURS[severity]/max(1.0,ratio)))
 def escalation_required(severity,quantity=0.0,threshold=1.0):
     return severity==SEVERITIES[-1] or (threshold>0 and quantity>=threshold)
+def recurrence_escalation(recurrence_total,quantity=0.0,last_reading=None):
+    if recurrence_total>RECURRENCE_ESCALATION_LIMIT: return True
+    return last_reading is not None and last_reading>0 and quantity>=2*last_reading
+def escalation_reason(recurrence_total,quantity=0.0,last_reading=None):
+    reasons=[]
+    if recurrence_total>RECURRENCE_ESCALATION_LIMIT: reasons.append("复发超过三次")
+    if last_reading is not None and last_reading>0 and quantity>=2*last_reading: reasons.append("渗流量较上次翻倍")
+    return "；".join(reasons)
 def can_transition(current,target): return target in TRANSITIONS.get(current,[])
 def validate_transition(current,target):
     if current not in STATES or target not in STATES: raise ValidationError("未知状态")
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
-def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
+def completion_blockers(target,open_records,escalation_status='none'):
+    if target not in TERMINAL_STATES: return []
+    blockers=[]
+    if open_records>0: blockers.append("仍有未关闭事项")
+    if escalation_status=='pending': blockers.append("应急升级待应急经理确认")
+    return blockers
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))

@@ -26,13 +26,21 @@ python3 app.py --db ./data.db --port 8316
 
 - `GET /health`
 - `GET /api/items`
-- `POST /api/items`
+- `POST /api/items`，可提交`dam_section`（坝段）、`measure_point`（测点）、`quantity`（本次读数），自动建立复发台账
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
-- `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/transition`，必须提交`expected_version`；关闭时可提交`conclusion`（处理结论）
+- `POST /api/items/{id}/escalation/confirm`，应急经理确认应急升级
 - `GET /api/audit`
 
 允许角色：inspector, dam_engineer, emergency_manager, viewer。异常值比控制阈值越高，缺陷优先级越高；应急处置缺陷必须完成复检并记录证据后才能关闭。
+
+## 复发台账
+
+- 新缺陷登记坝段、测点和本次读数（坝段与测点需同时填写）；同一坝段+测点已有未结缺陷时不新建单，沿用首张单，响应`merged=true`并累计`report_count`（续报次数），同时更新本次读数。
+- 新建单按测点关联上次已结缺陷（`previous_item_id`），`recurrence_count`沿测点历史累计复发次数（含各单续报），`last_reading`记录前次读数。
+- 复发次数（`recurrence_count + report_count`）超过3次，或本次读数较前次翻倍（≥2倍）时，缺陷自动提到`emergency`并置`escalation_status=pending`，需`emergency_manager`调用确认接口；确认前缺陷不可关闭。
+- 详情和列表返回`recurrence_total`（复发次数）、`report_count`（续报次数）、`last_conclusion`（上次已结缺陷结论，来自关闭结论或`conclusion`记录）和`blockers`（阻挡项：未关闭事项、待确认的应急升级）。
 
 ## 测试
 

@@ -66,6 +66,29 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        columns = {
+            "dam_section": "TEXT",
+            "measure_point": "TEXT",
+            "previous_item_id": "INTEGER",
+            "recurrence_count": "INTEGER NOT NULL DEFAULT 0",
+            "report_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_reading": "REAL",
+            "conclusion": "TEXT",
+            "escalation_status": "TEXT NOT NULL DEFAULT 'none'"
+                " CHECK(escalation_status IN ('none','pending','confirmed'))",
+        }
+        with self._lock, self.conn:
+            existing = {row["name"] for row in
+                        self.conn.execute("PRAGMA table_info(items)")}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE items ADD COLUMN {name} {ddl}")
+            self.conn.execute(
+                """CREATE INDEX IF NOT EXISTS ix_items_point
+                   ON items(dam_section, measure_point, status)""")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -73,21 +96,98 @@ class Repository:
 
     def create_item(self, title: str, description: str, severity: str,
                     quantity: float, threshold: float, external_ref: Optional[str],
-                    actor: str) -> Dict[str, Any]:
+                    actor: str, dam_section: Optional[str] = None,
+                    measure_point: Optional[str] = None,
+                    previous_item_id: Optional[int] = None,
+                    recurrence_count: int = 0,
+                    last_reading: Optional[float] = None) -> Dict[str, Any]:
         now = utc_now()
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO items(title, description, severity, quantity, threshold,
-                       status, version, external_ref, created_by, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                       status, version, external_ref, created_by, created_at, updated_at,
+                       dam_section, measure_point, previous_item_id, recurrence_count,
+                       last_reading)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (title, description, severity, quantity, threshold, STATES[0], 1,
-                     external_ref, actor, now, now),
+                     external_ref, actor, now, now, dam_section, measure_point,
+                     previous_item_id, recurrence_count, last_reading),
                 )
                 item_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
             raise ConflictError("external_ref已存在") from exc
         return self.get_item(item_id)
+
+    def find_open_by_point(self, dam_section: str,
+                           measure_point: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM items WHERE dam_section=? AND measure_point=?
+                   AND status!='closed' ORDER BY id LIMIT 1""",
+                (dam_section, measure_point),
+            ).fetchone()
+        return self._item(row) if row else None
+
+    def latest_by_point(self, dam_section: str,
+                        measure_point: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM items WHERE dam_section=? AND measure_point=?
+                   ORDER BY id DESC LIMIT 1""",
+                (dam_section, measure_point),
+            ).fetchone()
+        return self._item(row) if row else None
+
+    def merge_follow_up(self, item_id: int, quantity: float,
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE items SET report_count=report_count+1, last_reading=quantity,
+                   quantity=?, version=version+1, updated_at=? WHERE id=?""",
+                (quantity, now, item_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("项目不存在")
+        return self.get_item(item_id)
+
+    def set_escalation_pending(self, item_id: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE items SET severity='emergency', escalation_status='pending',
+                   version=version+1, updated_at=? WHERE id=?""",
+                (now, item_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("项目不存在")
+        return self.get_item(item_id)
+
+    def confirm_escalation(self, item_id: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE items SET escalation_status='confirmed', version=version+1,
+                   updated_at=? WHERE id=? AND escalation_status='pending'""",
+                (now, item_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("项目不存在")
+                raise ConflictError("当前无待确认的应急升级")
+        return self.get_item(item_id)
+
+    def latest_conclusion(self, item_id: int) -> Optional[str]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT detail FROM records WHERE item_id=? AND kind='conclusion'
+                   ORDER BY id DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return row["detail"] if row else None
 
     def get_item(self, item_id: int) -> Dict[str, Any]:
         with self._lock:
@@ -108,14 +208,21 @@ class Repository:
         return [self._item(row) for row in rows]
 
     def transition_item(self, item_id: int, target: str, expected_version: int,
-                        actor: str) -> Dict[str, Any]:
+                        actor: str, conclusion: Optional[str] = None) -> Dict[str, Any]:
         now = utc_now()
         with self._lock, self.conn:
-            cur = self.conn.execute(
-                """UPDATE items SET status=?, version=version+1, updated_at=?
-                   WHERE id=? AND version=?""",
-                (target, now, item_id, expected_version),
-            )
+            if conclusion is not None:
+                cur = self.conn.execute(
+                    """UPDATE items SET status=?, conclusion=?, version=version+1,
+                       updated_at=? WHERE id=? AND version=?""",
+                    (target, conclusion, now, item_id, expected_version),
+                )
+            else:
+                cur = self.conn.execute(
+                    """UPDATE items SET status=?, version=version+1, updated_at=?
+                       WHERE id=? AND version=?""",
+                    (target, now, item_id, expected_version),
+                )
             if cur.rowcount == 0:
                 exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
                 if exists is None:
