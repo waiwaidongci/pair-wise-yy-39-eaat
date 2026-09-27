@@ -109,7 +109,8 @@ def make_handler(service: Service, static_dir: str):
                 actor, role = self._identity()
                 body = self._body()
                 if path == "/api/items":
-                    self._json(201, service.create_item(body, actor, role))
+                    result = service.create_item(body, actor, role)
+                    self._json(200 if result.get("merged") else 201, result)
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
@@ -118,7 +119,13 @@ def make_handler(service: Service, static_dir: str):
                     target = body.get("target")
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
-                        item_id, target, expected, actor, role))
+                        item_id, target, expected, actor, role,
+                        conclusion=body.get("conclusion")))
+                elif path.startswith("/api/items/") and path.endswith("/confirm_escalation"):
+                    item_id = int(path.split("/")[3])
+                    expected = body.get("expected_version")
+                    self._json(200, service.confirm_escalation(
+                        item_id, expected, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
